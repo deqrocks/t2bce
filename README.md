@@ -1,0 +1,95 @@
+# Apple T2 BCE modules
+
+This repository contains the Apple T2 BCE driver stack.
+It is intended as a testable replacement for `apple-bce` on t2linux distros 
+before the drivers are prepared for upstream submission.
+
+T2linux users should test it by blacklisting `apple-bce`, installing these modules, and
+rebooting.
+
+## Changes compared to apple-bce
+
+User noticeable changes are
+
+- Lower power draw on media playback and when the Mac is turned off
+- Increased suspend/resume stability
+- Automatic switching between headphones/internal speakers
+- Less audio stutter issues
+- Silent logs
+
+T2bce is an MFD driver that is divided into separate kernel modules:
+
+- `t2bce_core` - PCI device, mailbox, transport API and PM coordination
+- `t2bce_dma` - BCE DMA queue engine
+- `t2bce_vhci` - virtual USB 2.0 host controller for bridgeOS devices
+- `t2bce_audio` - ALSA driver for Apple T2 audio endpoints
+
+This layout is closer to the hardware model than apple-bce: the PCI/BCE core, DMA queues,
+virtual USB host controller, and audio driver are separate pieces of one stack.
+It also makes logs and module dependencies easier to inspect when testing.
+
+- VHCI submits scatter-gather USB URBs as BCE segment lists instead of forcing
+  all transfers through one contiguous DMA buffer. This is especially relevant
+  for higher-bandwidth bridgeOS USB devices such as the internal camera.
+- PM path handling is coordinated through the BCE core.
+- Audio is a separate ALSA driver module with an ALSA UCM profile for
+  desktop routing. The kernel layout exposes the physical T2 audio endpoints as
+  separate PCMs, and the UCM profile maps them to normal desktop ports.
+- Transport and queue APIs, so audio and VHCI no longer need to reach into BCE
+  queue internals directly.
+
+Known issues / needs your feedback:
+
+- Headphone jack output can still stutter on some models. Internal speakers and
+  headphone behavior should be reported per Mac model.
+- Webcam and other bridgeOS USB devices are important SG-DMA test cases and also model dependent.
+
+Please include the Mac model identifier, kernel version, loaded module versions,
+and relevant `dmesg` or `journalctl -k` lines when reporting results.
+
+## Requirements
+
+Install the kernel headers/build files for the running kernel. On Fedora for example:
+
+```sh
+sudo dnf install kernel-devel kernel-headers make gcc
+```
+
+## Build and install
+
+```sh
+make && sudo make install
+```
+
+`make install` installs the modules below `/lib/modules/$(uname -r)/extra/t2bce`,
+installs the ALSA UCM profile below `/usr/share/alsa/ucm2`, and runs `depmod`.
+
+## Blacklist apple-bce
+
+Blacklist `apple-bce` when installing this replacement stack:
+
+```sh
+echo 'blacklist apple-bce' | sudo tee /etc/modprobe.d/blacklist-apple-bce.conf
+```
+
+Reboot after installation so the old `apple-bce` module cannot bind first.
+
+## Quick checks
+
+```sh
+lsmod | grep -E 't2bce|apple_bce|apple-bce'
+modinfo t2bce_core
+modinfo t2bce_dma
+modinfo t2bce_vhci
+modinfo t2bce_audio
+aplay -l
+```
+
+## Uninstall
+
+```sh
+sudo make uninstall
+sudo rm -f /etc/modprobe.d/blacklist-apple-bce.conf
+```
+
+Reboot after uninstalling if any T2 BCE module was loaded.
