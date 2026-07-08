@@ -347,6 +347,8 @@ static void t2audio_reset_stream(struct t2audio_stream *stream)
     stream->waiting_for_first_ts = true;
     stream->remote_timestamp = 0;
     stream->frame_min = stream->latency;
+    stream->erase_head = 0;
+    stream->erase_head_valid = false;
 }
 
 static void t2audio_reset_streams(struct t2audio_device *a)
