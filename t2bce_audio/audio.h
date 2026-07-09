@@ -78,6 +78,7 @@ struct t2audio_stream {
 
     bool waiting_for_first_ts;
 
+    ktime_t start_io_time;
     ktime_t remote_timestamp;
     snd_pcm_sframes_t frame_min;
     snd_pcm_uframes_t erase_head;

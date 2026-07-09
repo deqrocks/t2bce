@@ -2,6 +2,7 @@
 #include "audio.h"
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
+#include <linux/ktime.h>
 
 static u64 t2audio_get_alsa_fmtbit(struct t2audio_apple_description *desc)
 {
@@ -325,8 +326,11 @@ static int t2audio_pcm_start(struct snd_pcm_substream *substream)
     if (status)
         return status;
 
+    stream->start_io_time = ktime_get_boottime();
+
     time_end = ktime_get();
-    pr_debug("t2bce_audio: Started the audio device in %lluns\n", ktime_to_ns(time_end - time_start));
+    pr_debug("t2bce_audio: start_io %s %lld us\n",
+            sdev->uid, ktime_to_us(ktime_sub(time_end, time_start)));
     return 0;
 }
 
@@ -343,12 +347,14 @@ static int t2audio_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
         return 0;
     switch (cmd) {
         case SNDRV_PCM_TRIGGER_START:
+            pr_debug("t2bce_audio: TRIGGER START %s\n", sdev->uid);
             err = t2audio_pcm_start(substream);
             if (err)
                 return err;
             stream->started = 1;
             break;
         case SNDRV_PCM_TRIGGER_STOP:
+            pr_debug("t2bce_audio: TRIGGER STOP %s\n", sdev->uid);
             t2audio_cmd_stop_io(sdev->a, sdev->dev_id);
             stream->started = 0;
             stream->erase_head_valid = false;
@@ -366,13 +372,21 @@ static snd_pcm_uframes_t t2audio_pcm_pointer(struct snd_pcm_substream *substream
     snd_pcm_sframes_t frames;
     snd_pcm_sframes_t buffer_time_length;
 
-    if (!stream->started || stream->waiting_for_first_ts) {
-        pr_debug("t2audio_pcm_pointer while not started\n");
+    if (!stream->started)
         return 0;
-    }
+
+    /*
+     * If we haven't received the first bridgeOS timestamp yet, use the
+     * local clock anchored at start_io completion as a fallback.  The
+     * DMA may have been running for tens of milliseconds (especially
+     * on codec outputs), so reporting 0 would starve the pipeline.
+     */
+    if (stream->waiting_for_first_ts)
+        time_from_start = ktime_get_boottime() - stream->start_io_time;
+    else
+        time_from_start = ktime_get_boottime() - stream->remote_timestamp;
 
     /* bridgeOS reports coarse timestamps; interpolate the ALSA pointer locally. */
-    time_from_start = ktime_get_boottime() - stream->remote_timestamp;
     buffer_time_length = NSEC_PER_SEC * substream->runtime->buffer_size / substream->runtime->rate;
     frames = (ktime_to_ns(time_from_start) % buffer_time_length) * substream->runtime->buffer_size / buffer_time_length;
     if (ktime_to_ns(time_from_start) < buffer_time_length) {
@@ -457,15 +471,20 @@ int t2audio_create_pcm(struct t2audio_subdevice *sdev)
     return 0;
 }
 
-static void t2audio_handle_stream_timestamp(struct snd_pcm_substream *substream, ktime_t timestamp)
+static void t2audio_handle_stream_timestamp(struct snd_pcm_substream *substream,
+                                            ktime_t os_timestamp, u64 dev_timestamp)
 {
     unsigned long flags;
     struct t2audio_stream *stream;
+    struct t2audio_subdevice *sdev = snd_pcm_substream_chip(substream);
 
     stream = t2audio_pcm_stream(substream);
     snd_pcm_stream_lock_irqsave(substream, flags);
-    stream->remote_timestamp = timestamp;
+    /* Use T2 clock — the DMA engine runs on this time domain. */
+    stream->remote_timestamp = (s64)dev_timestamp;
     if (stream->waiting_for_first_ts) {
+        pr_debug("t2bce_audio: first ts on %s (t2=%lld host=%lld)\n",
+                sdev->uid, dev_timestamp, ktime_to_ns(os_timestamp));
         stream->waiting_for_first_ts = false;
         snd_pcm_stream_unlock_irqrestore(substream, flags);
         return;
@@ -481,8 +500,8 @@ void t2audio_handle_timestamp(struct t2audio_subdevice *sdev, ktime_t os_timesta
 
     substream = sdev->pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream;
     if (substream)
-        t2audio_handle_stream_timestamp(substream, os_timestamp);
+        t2audio_handle_stream_timestamp(substream, os_timestamp, dev_timestamp);
     substream = sdev->pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream;
     if (substream)
-        t2audio_handle_stream_timestamp(substream, os_timestamp);
+        t2audio_handle_stream_timestamp(substream, os_timestamp, dev_timestamp);
 }
