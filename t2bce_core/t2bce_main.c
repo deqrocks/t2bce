@@ -5,24 +5,24 @@
 #include <linux/version.h>
 
 /*
- * Apple T2 systems contain a separate coprocessor running bridgeOS.  It owns
- * platform services such as SMC, SEP, AVE and several internal peripherals.
- * Linux sees part of that world through this PCI function: a mailbox for
- * coarse commands plus Buffer Copy Engine (BCE) DMA queues for client
- * protocols.
+ * Apple T2 Macs contain a coprocessor serving as a board supervisor.
+ * The T2 is basically a repurposed iPhone CPU running bridgeOS,
+ * a stripped down version of WatchOS. Apple reuses the audio codec
+ * and USB interfaces of this SOC and uses a "Buffer Copy Engine" (BCE)
+ * for communication between the host OS, the T2 and the VHCI USB devices
+ * behind the T2 USB hub like internal keyboard, trackpad, touchbar etc..
  *
  * This core driver owns the BCE PCI device, mailbox, DMA queue registration
- * and system PM ordering.  Other modules bind as clients: t2bce_audio exposes
- * the bridgeOS audio endpoints to ALSA, t2bce_vhci exposes the T2-internal
- * virtual USB hub to usbcore, and t2bce_dma provides the queue engine used by
- * both.  Some T2 services enumerate behind the virtual USB hub, including the
- * 480 Mbit/s CDC-NCM link to bridgeOS.
+ * and system PM ordering. Other modules bind as clients:
+ * - t2bce_audio exposes the bridgeOS audio endpoints to ALSA.
+ * - t2bce_vhci exposes the T2-internal virtual USB hub and devices to usbcore.
+ * - t2bce_dma provides the queue engine used by both.
  *
  * ACPI describes the host-side PCI devices, but bridgeOS still controls the
  * remote endpoints and must be kept in sync during probe, shutdown and system
- * suspend/resume.  The PM code below mirrors the observed firmware ordering:
- * quiesce clients, drain the mailbox channel, ask bridgeOS to save or discard
- * BCE state, then let clients rebuild or continue according to the selected
+ * suspend/resume. The PM code below mirrors the observed firmware ordering:
+ * It quiesces clients, drains the mailbox channel, asks bridgeOS to save or discard
+ * BCE state, then lets clients rebuild or continue according to the selected
  * resume path.
  */
 
@@ -760,7 +760,7 @@ static void __exit t2bce_module_exit(void)
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("André Eikmeyer <andre.eikmeyer@gmail.com>");
 MODULE_DESCRIPTION("T2 BCE core driver");
-MODULE_VERSION("0.07");
+MODULE_VERSION("0.06");
 MODULE_SOFTDEP("post: t2bce_vhci");
 module_init(t2bce_module_init);
 module_exit(t2bce_module_exit);
