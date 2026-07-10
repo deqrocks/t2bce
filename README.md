@@ -64,6 +64,28 @@ make && sudo make install
 `make install` installs the modules below `/lib/modules/$(uname -r)/extra/t2bce`,
 installs the ALSA UCM profile below `/usr/share/alsa/ucm2`, and runs `depmod`.
 
+## Kernel tree export
+
+The driver sources can be exported with in-tree Kconfig and Kbuild files for
+distribution kernel patch sets:
+
+```sh
+./export-kernel-tree.sh /path/to/linux/drivers/staging/t2bce
+```
+
+The export contains only kernel sources. DKMS files, standalone build targets,
+documentation, and the ALSA UCM profile are intentionally excluded.
+
+To generate the two patches used by the t2linux kernel patch set from a Linux
+git tree, run:
+
+```sh
+./generate-kernel-patches.sh /path/to/linux /path/to/output
+```
+
+The generator works in a temporary clone and does not modify the supplied
+Linux tree. It refuses to overwrite existing T2BCE patches.
+
 ## Blacklist apple-bce
 
 Blacklist `apple-bce` when installing this replacement stack:
