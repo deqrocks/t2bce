@@ -44,8 +44,14 @@ Known issues / needs your feedback:
   headphone behavior should be reported per Mac model.
 - Webcam and other bridgeOS USB devices are important SG-DMA test cases and also model dependent.
 
+t2bce_audio uses `pr_debug` instead of `pr_info` for keeping the journal clean.
+You can dynamically activate verbose logging by running
+``` 
+echo 'module t2bce_audio +p' | sudo tee /proc/dynamic_debug/control
+```
+
 Please include the Mac model identifier, kernel version, loaded module versions,
-and relevant `dmesg` or `journalctl -k` lines when reporting results.
+and relevant `dmesg` lines when reporting results.
 
 ## Requirements
 
