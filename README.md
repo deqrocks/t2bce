@@ -91,7 +91,7 @@ Linux tree. It refuses to overwrite existing T2BCE patches.
 Blacklist `apple-bce` when installing this replacement stack:
 
 ```sh
-echo 'blacklist apple-bce' | sudo tee /etc/modprobe.d/blacklist-apple-bce.conf
+echo 'blacklist apple_bce' | sudo tee /etc/modprobe.d/blacklist-apple-bce.conf
 ```
 
 Reboot after installation so the old `apple-bce` module cannot bind first.
