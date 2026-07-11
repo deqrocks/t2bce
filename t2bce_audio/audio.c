@@ -23,6 +23,7 @@ static void t2audio_init_dev(struct t2audio_device *a, t2audio_device_id_t dev_i
 static void t2audio_free_dev(struct t2audio_subdevice *sdev);
 static void t2audio_reset_stream(struct t2audio_stream *stream);
 static void t2audio_reset_streams(struct t2audio_device *a);
+static void t2audio_reset_clock(struct t2audio_device *a);
 static void t2audio_resume_work(struct work_struct *ws);
 static void t2audio_resume_complete(void *userdata);
 static void t2audio_pm_prepare_client(void *userdata);
@@ -79,6 +80,9 @@ static int t2audio_probe(struct pci_dev *dev, const struct pci_device_id *id)
     init_completion(&t2audio->remote_alive);
     INIT_WORK(&t2audio->resume_work, t2audio_resume_work);
     INIT_LIST_HEAD(&t2audio->subdevice_list);
+    spin_lock_init(&t2audio->clock_lock);
+    t2audio->clock_samples = 0;
+    t2audio->clock_offset_valid = false;
 
     /* Init: set an unknown flag in the bitset */
     if (pci_read_config_dword(dev, 4, &cfg))
@@ -212,17 +216,17 @@ static int t2audio_quiesce(struct t2audio_device *t2audio, bool suspend_pcm)
         bool stopped_io = false;
 
         for (i = 0; i < sdev->out_stream_cnt; i++) {
-            if (!sdev->out_streams[i].started)
+            if (!smp_load_acquire(&sdev->out_streams[i].started))
                 continue;
             stopped_io = true;
-            sdev->out_streams[i].started = 0;
+            smp_store_release(&sdev->out_streams[i].started, 0);
         }
 
         for (i = 0; i < sdev->in_stream_cnt; i++) {
-            if (!sdev->in_streams[i].started)
+            if (!smp_load_acquire(&sdev->in_streams[i].started))
                 continue;
             stopped_io = true;
-            sdev->in_streams[i].started = 0;
+            smp_store_release(&sdev->in_streams[i].started, 0);
         }
 
         if (stopped_io)
@@ -246,7 +250,7 @@ static int t2audio_suspend(struct device *dev)
     struct t2audio_device *t2audio = pci_get_drvdata(to_pci_dev(dev));
     int status;
 
-    dev_dbg(t2audio->dev, "suspend entry\n");
+    pr_debug("t2bce_audio: suspend entry\n");
     status = t2audio_quiesce(t2audio, true);
     pci_disable_device(t2audio->pci);
     pr_info("t2bce_audio: suspend exit status=%d\n", status);
@@ -306,6 +310,7 @@ static int t2audio_resume(struct device *dev)
 
     t2audio->resume_deferred = false;
     t2audio->pm_quiesced = false;
+    t2audio_reset_clock(t2audio);
     t2audio_reset_streams(t2audio);
 
     pr_info("t2bce_audio: resume exit status=0 path=%s\n", path);
@@ -328,6 +333,8 @@ static void t2audio_resume_work(struct work_struct *ws)
 
     t2audio->resume_deferred = false;
     t2audio->pm_quiesced = false;
+    t2audio_reset_clock(t2audio);
+    t2audio_reset_streams(t2audio);
     pr_info("t2bce_audio: resume deferred path complete\n");
 }
 
@@ -343,12 +350,25 @@ static void t2audio_resume_complete(void *userdata)
 
 static void t2audio_reset_stream(struct t2audio_stream *stream)
 {
-    stream->started = 0;
+    smp_store_release(&stream->started, 0);
     stream->waiting_for_first_ts = true;
     stream->remote_timestamp = 0;
+    stream->timestamp_accept_after = 0;
+    stream->clock_offset_ns = 0;
+    stream->timestamp_seed = 0;
+    stream->clock_offset_valid = false;
     stream->frame_min = stream->latency;
-    stream->erase_head = 0;
-    stream->erase_head_valid = false;
+}
+
+static void t2audio_reset_clock(struct t2audio_device *a)
+{
+    unsigned long flags;
+
+    spin_lock_irqsave(&a->clock_lock, flags);
+    a->clock_offset_ns = 0;
+    a->clock_samples = 0;
+    a->clock_offset_valid = false;
+    spin_unlock_irqrestore(&a->clock_lock, flags);
 }
 
 static void t2audio_reset_streams(struct t2audio_device *a)
@@ -732,7 +752,7 @@ static void t2audio_handle_jack_connection_change(struct t2audio_subdevice *sdev
         dev_err(sdev->a->dev, "Failed to get jack enable status\n");
         return;
     }
-    dev_dbg(sdev->a->dev, "Jack is now %s\n", plugged ? "plugged" : "unplugged");
+    pr_debug("t2bce_audio: Jack is now %s\n", plugged ? "plugged" : "unplugged");
     snd_jack_report(sdev->jack, plugged ? sdev->jack->type : 0);
 }
 
@@ -746,7 +766,7 @@ void t2audio_handle_prop_change_work(struct work_struct *ws)
         dev_err(work->a->dev, "Property notification change: device not found\n");
         goto done;
     }
-    dev_dbg(work->a->dev, "Property changed for device: %s\n", sdev->uid);
+    pr_debug("t2bce_audio: Property changed for device: %s\n", sdev->uid);
 
     if (work->prop.scope == T2AUDIO_PROP_SCOPE_OUTPUT && work->prop.selector == T2AUDIO_PROP_JACK_PLUGGED) {
         t2audio_handle_jack_connection_change(sdev);
@@ -775,14 +795,34 @@ void t2audio_handle_prop_change(struct t2audio_device *a, struct t2audio_msg *ms
 void t2audio_handle_cmd_timestamp(struct t2audio_device *a, struct t2audio_msg *msg)
 {
     ktime_t time_os = ktime_get_boottime();
+    unsigned long flags;
     struct t2audio_send_ctx sctx;
     struct t2audio_subdevice *sdev;
+    bool clock_ready;
+    s64 clock_offset_ns;
+    s64 offset_sample;
     u64 devid, timestamp, update_seed;
     t2audio_msg_read_update_timestamp(msg, &devid, &timestamp, &update_seed);
-    dev_dbg(a->dev, "Received timestamp update for dev=%llx ts=%llx seed=%llx\n", devid, timestamp, update_seed);
+
+    offset_sample = ktime_to_ns(time_os) - (s64)timestamp;
+    spin_lock_irqsave(&a->clock_lock, flags);
+    if (!a->clock_offset_valid || offset_sample < a->clock_offset_ns) {
+        a->clock_offset_ns = offset_sample;
+        a->clock_offset_valid = true;
+    }
+    if (a->clock_samples < 2)
+        a->clock_samples++;
+    clock_offset_ns = a->clock_offset_ns;
+    clock_ready = a->clock_samples >= 2;
+    spin_unlock_irqrestore(&a->clock_lock, flags);
+    pr_debug("t2bce_audio: timestamp dev=%llx t2=%llx host=%lld seed=%llx sample_offset=%lld clock_offset=%lld\n",
+            devid, timestamp, ktime_to_ns(time_os), update_seed,
+            offset_sample, clock_offset_ns);
 
     sdev = t2audio_find_dev_by_dev_id(a, devid);
-    t2audio_handle_timestamp(sdev, time_os, timestamp);
+    if (sdev)
+        t2audio_handle_timestamp(sdev, timestamp, update_seed, clock_offset_ns,
+                clock_ready);
 
     t2audio_send_cmd_response(a, &sctx, msg,
             t2audio_msg_write_update_timestamp_response);

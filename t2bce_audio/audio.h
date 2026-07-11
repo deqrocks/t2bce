@@ -78,11 +78,12 @@ struct t2audio_stream {
 
     bool waiting_for_first_ts;
 
-    ktime_t start_io_time;
     ktime_t remote_timestamp;
+    ktime_t timestamp_accept_after;
+    s64 clock_offset_ns;
+    u64 timestamp_seed;
+    bool clock_offset_valid;
     snd_pcm_sframes_t frame_min;
-    snd_pcm_uframes_t erase_head;
-    bool erase_head_valid;
     int started;
 };
 struct t2audio_subdevice {
@@ -130,6 +131,11 @@ struct t2audio_device {
     struct work_struct resume_work;
     bool resume_deferred;
     bool pm_quiesced;
+
+    spinlock_t clock_lock;
+    s64 clock_offset_ns;
+    u32 clock_samples;
+    bool clock_offset_valid;
 };
 
 void t2audio_handle_notification(struct t2audio_device *a, struct t2audio_msg *msg);

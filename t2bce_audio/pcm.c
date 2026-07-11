@@ -195,40 +195,14 @@ static void t2audio_pcm_zero_frames(struct snd_pcm_substream *substream,
     t2audio_dma_memset(buf, 0, 0, frames_to_bytes(runtime, frames - (runtime->buffer_size - first)));
 }
 
-static void t2audio_pcm_erase_played_frames(struct snd_pcm_substream *substream,
-        snd_pcm_uframes_t hw_ptr)
-{
-    struct t2audio_stream *stream = t2audio_pcm_stream(substream);
-    struct snd_pcm_runtime *runtime = substream->runtime;
-    snd_pcm_uframes_t frames;
-
-    if (substream->stream != SNDRV_PCM_STREAM_PLAYBACK || !runtime || !runtime->buffer_size)
-        return;
-
-    /*
-     * IOAudioFamily keeps an erase head for output engines and clears samples
-     * once the hardware position has passed them. Codec Output appears to be
-     * sensitive to stale samples after route changes, so keep the BridgeOS
-     * playback ring in the same consumed-is-silent state.
-     */
-    hw_ptr %= runtime->buffer_size;
-    if (!stream->erase_head_valid) {
-        stream->erase_head = 0;
-        stream->erase_head_valid = true;
-    }
-
-    if (hw_ptr >= stream->erase_head)
-        frames = hw_ptr - stream->erase_head;
-    else
-        frames = runtime->buffer_size - stream->erase_head + hw_ptr;
-
-    t2audio_pcm_zero_frames(substream, stream->erase_head, frames);
-    stream->erase_head = hw_ptr;
-}
-
 static int t2audio_pcm_open(struct snd_pcm_substream *substream)
 {
-    pr_debug("t2audio_pcm_open\n");
+    struct t2audio_subdevice *sdev = snd_pcm_substream_chip(substream);
+
+    pr_debug("t2bce_audio: pcm open dev=%s direction=%s substream=%u\n",
+            sdev->uid,
+            substream->stream == SNDRV_PCM_STREAM_PLAYBACK ? "playback" : "capture",
+            substream->number);
     substream->runtime->hw = *t2audio_pcm_stream(substream)->alsa_hw_desc;
 
     return 0;
@@ -236,7 +210,12 @@ static int t2audio_pcm_open(struct snd_pcm_substream *substream)
 
 static int t2audio_pcm_close(struct snd_pcm_substream *substream)
 {
-    pr_debug("t2audio_pcm_close\n");
+    struct t2audio_subdevice *sdev = snd_pcm_substream_chip(substream);
+
+    pr_debug("t2bce_audio: pcm close dev=%s direction=%s substream=%u\n",
+            sdev->uid,
+            substream->stream == SNDRV_PCM_STREAM_PLAYBACK ? "playback" : "capture",
+            substream->number);
     return 0;
 }
 
@@ -246,9 +225,11 @@ static int t2audio_pcm_prepare(struct snd_pcm_substream *substream)
 
     stream->waiting_for_first_ts = true;
     stream->remote_timestamp = 0;
+    stream->timestamp_accept_after = 0;
+    stream->clock_offset_ns = 0;
+    stream->timestamp_seed = 0;
+    stream->clock_offset_valid = false;
     stream->frame_min = stream->latency;
-    stream->erase_head = 0;
-    stream->erase_head_valid = false;
 
     if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK && substream->runtime->buffer_size)
         t2audio_pcm_zero_frames(substream, 0, substream->runtime->buffer_size);
@@ -258,8 +239,13 @@ static int t2audio_pcm_prepare(struct snd_pcm_substream *substream)
 
 static int t2audio_pcm_hw_params(struct snd_pcm_substream *substream, struct snd_pcm_hw_params *hw_params)
 {
+    struct t2audio_subdevice *sdev = snd_pcm_substream_chip(substream);
     struct t2audio_stream *astream = t2audio_pcm_stream(substream);
-    pr_debug("t2audio_pcm_hw_params\n");
+
+    pr_debug("t2bce_audio: pcm hw_params dev=%s direction=%s substream=%u\n",
+            sdev->uid,
+            substream->stream == SNDRV_PCM_STREAM_PLAYBACK ? "playback" : "capture",
+            substream->number);
 
     if (!astream->buffer_cnt || !astream->buffers)
         return -EINVAL;
@@ -272,7 +258,12 @@ static int t2audio_pcm_hw_params(struct snd_pcm_substream *substream, struct snd
 
 static int t2audio_pcm_hw_free(struct snd_pcm_substream *substream)
 {
-    pr_debug("t2audio_pcm_hw_free\n");
+    struct t2audio_subdevice *sdev = snd_pcm_substream_chip(substream);
+
+    pr_debug("t2bce_audio: pcm hw_free dev=%s direction=%s substream=%u\n",
+            sdev->uid,
+            substream->stream == SNDRV_PCM_STREAM_PLAYBACK ? "playback" : "capture",
+            substream->number);
     return 0;
 }
 
@@ -288,6 +279,7 @@ static int t2audio_pcm_start(struct snd_pcm_substream *substream)
     int status;
 
     time_start = ktime_get();
+    smp_store_release(&stream->started, 0);
 
     back_buffer = (substream->stream == SNDRV_PCM_STREAM_PLAYBACK);
 
@@ -313,11 +305,6 @@ static int t2audio_pcm_start(struct snd_pcm_substream *substream)
         }
     }
 
-    stream->waiting_for_first_ts = true;
-    stream->frame_min = stream->latency;
-    stream->erase_head = 0;
-    stream->erase_head_valid = false;
-
     status = t2audio_cmd_start_io(sdev->a, sdev->dev_id);
     if (back_buffer && buf)
         t2audio_dma_copy_to(dmabuf, 0, buf, s);
@@ -326,7 +313,15 @@ static int t2audio_pcm_start(struct snd_pcm_substream *substream)
     if (status)
         return status;
 
-    stream->start_io_time = ktime_get_boottime();
+    /* Timestamps received while START_IO was pending belong to the old epoch. */
+    stream->remote_timestamp = 0;
+    stream->waiting_for_first_ts = true;
+    stream->timestamp_accept_after = ktime_get_boottime();
+    stream->clock_offset_ns = 0;
+    stream->timestamp_seed = 0;
+    stream->clock_offset_valid = false;
+    stream->frame_min = stream->latency;
+    smp_store_release(&stream->started, 1);
 
     time_end = ktime_get();
     pr_debug("t2bce_audio: start_io %s %lld us\n",
@@ -340,8 +335,6 @@ static int t2audio_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
     struct t2audio_stream *stream = t2audio_pcm_stream(substream);
     int err;
 
-    pr_debug("t2audio_pcm_trigger %x\n", cmd);
-
     /* bridgeOS exposes one ALSA substream per remote stream. */
     if (substream->number != 0)
         return 0;
@@ -351,13 +344,19 @@ static int t2audio_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
             err = t2audio_pcm_start(substream);
             if (err)
                 return err;
-            stream->started = 1;
             break;
         case SNDRV_PCM_TRIGGER_STOP:
             pr_debug("t2bce_audio: TRIGGER STOP %s\n", sdev->uid);
-            t2audio_cmd_stop_io(sdev->a, sdev->dev_id);
-            stream->started = 0;
-            stream->erase_head_valid = false;
+            smp_store_release(&stream->started, 0);
+            err = t2audio_cmd_stop_io(sdev->a, sdev->dev_id);
+            stream->remote_timestamp = 0;
+            stream->waiting_for_first_ts = true;
+            stream->timestamp_accept_after = 0;
+            stream->clock_offset_ns = 0;
+            stream->timestamp_seed = 0;
+            stream->clock_offset_valid = false;
+            if (err)
+                return err;
             break;
         default:
             return -EINVAL;
@@ -372,21 +371,13 @@ static snd_pcm_uframes_t t2audio_pcm_pointer(struct snd_pcm_substream *substream
     snd_pcm_sframes_t frames;
     snd_pcm_sframes_t buffer_time_length;
 
-    if (!stream->started)
+    if (!smp_load_acquire(&stream->started) || stream->waiting_for_first_ts)
         return 0;
 
-    /*
-     * If we haven't received the first bridgeOS timestamp yet, use the
-     * local clock anchored at start_io completion as a fallback.  The
-     * DMA may have been running for tens of milliseconds (especially
-     * on codec outputs), so reporting 0 would starve the pipeline.
-     */
-    if (stream->waiting_for_first_ts)
-        time_from_start = ktime_get_boottime() - stream->start_io_time;
-    else
-        time_from_start = ktime_get_boottime() - stream->remote_timestamp;
-
     /* bridgeOS reports coarse timestamps; interpolate the ALSA pointer locally. */
+    time_from_start = ktime_get_boottime() - stream->remote_timestamp;
+    if (ktime_to_ns(time_from_start) < 0)
+        return 0;
     buffer_time_length = NSEC_PER_SEC * substream->runtime->buffer_size / substream->runtime->rate;
     frames = (ktime_to_ns(time_from_start) % buffer_time_length) * substream->runtime->buffer_size / buffer_time_length;
     if (ktime_to_ns(time_from_start) < buffer_time_length) {
@@ -404,7 +395,6 @@ static snd_pcm_uframes_t t2audio_pcm_pointer(struct snd_pcm_substream *substream
     if (frames < 0)
         frames += ((-frames - 1) / substream->runtime->buffer_size + 1) * substream->runtime->buffer_size;
     frames %= substream->runtime->buffer_size;
-    t2audio_pcm_erase_played_frames(substream, (snd_pcm_uframes_t) frames);
     return (snd_pcm_uframes_t) frames;
 }
 
@@ -472,19 +462,39 @@ int t2audio_create_pcm(struct t2audio_subdevice *sdev)
 }
 
 static void t2audio_handle_stream_timestamp(struct snd_pcm_substream *substream,
-                                            ktime_t os_timestamp, u64 dev_timestamp)
+                                            u64 dev_timestamp, u64 update_seed,
+                                            s64 clock_offset_ns, bool clock_ready)
 {
     unsigned long flags;
+    ktime_t event_timestamp;
     struct t2audio_stream *stream;
     struct t2audio_subdevice *sdev = snd_pcm_substream_chip(substream);
 
     stream = t2audio_pcm_stream(substream);
     snd_pcm_stream_lock_irqsave(substream, flags);
-    /* Use T2 clock — the DMA engine runs on this time domain. */
-    stream->remote_timestamp = (s64)dev_timestamp;
+    if (!smp_load_acquire(&stream->started)) {
+        snd_pcm_stream_unlock_irqrestore(substream, flags);
+        return;
+    }
+    if (!clock_ready) {
+        snd_pcm_stream_unlock_irqrestore(substream, flags);
+        return;
+    }
+    if (!stream->clock_offset_valid || stream->timestamp_seed != update_seed) {
+        stream->clock_offset_ns = clock_offset_ns;
+        stream->timestamp_seed = update_seed;
+        stream->clock_offset_valid = true;
+    }
+    event_timestamp = ns_to_ktime((s64)dev_timestamp + stream->clock_offset_ns);
+    if (ktime_before(event_timestamp, stream->timestamp_accept_after)) {
+        pr_debug("t2bce_audio: ignoring pre-start timestamp dev=%s event=%lld accept_after=%lld\n",
+                sdev->uid, ktime_to_ns(event_timestamp),
+                ktime_to_ns(stream->timestamp_accept_after));
+        snd_pcm_stream_unlock_irqrestore(substream, flags);
+        return;
+    }
+    stream->remote_timestamp = event_timestamp;
     if (stream->waiting_for_first_ts) {
-        pr_debug("t2bce_audio: first ts on %s (t2=%lld host=%lld)\n",
-                sdev->uid, dev_timestamp, ktime_to_ns(os_timestamp));
         stream->waiting_for_first_ts = false;
         snd_pcm_stream_unlock_irqrestore(substream, flags);
         return;
@@ -494,14 +504,17 @@ static void t2audio_handle_stream_timestamp(struct snd_pcm_substream *substream,
         snd_pcm_period_elapsed(substream);
 }
 
-void t2audio_handle_timestamp(struct t2audio_subdevice *sdev, ktime_t os_timestamp, u64 dev_timestamp)
+void t2audio_handle_timestamp(struct t2audio_subdevice *sdev, u64 dev_timestamp,
+        u64 update_seed, s64 clock_offset_ns, bool clock_ready)
 {
     struct snd_pcm_substream *substream;
 
     substream = sdev->pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream;
     if (substream)
-        t2audio_handle_stream_timestamp(substream, os_timestamp, dev_timestamp);
+        t2audio_handle_stream_timestamp(substream, dev_timestamp, update_seed,
+                clock_offset_ns, clock_ready);
     substream = sdev->pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream;
     if (substream)
-        t2audio_handle_stream_timestamp(substream, os_timestamp, dev_timestamp);
+        t2audio_handle_stream_timestamp(substream, dev_timestamp, update_seed,
+                clock_offset_ns, clock_ready);
 }
