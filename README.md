@@ -94,13 +94,18 @@ Linux tree. It refuses to overwrite existing T2BCE patches.
 
 ## Blacklist apple-bce
 
-Blacklist `apple-bce` when installing this replacement stack:
+Blacklist `apple-bce` on initcall using GRUB:
 
 ```sh
-echo 'blacklist apple_bce' | sudo tee /etc/modprobe.d/blacklist-apple-bce.conf
+initcall_blacklist=apple_bce
 ```
-
+Don't forget to update GRUB.
 Reboot after installation so the old `apple-bce` module cannot bind first.
+After reboot, check with `journalctl -b --grep=apple_bce`. It should show
+
+```
+Module apple_bce is blacklisted
+```
 
 ## Quick checks
 
