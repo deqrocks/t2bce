@@ -38,20 +38,15 @@ It also makes logs and module dependencies easier to inspect when testing.
 - Transport and queue APIs, so audio and VHCI no longer need to reach into BCE
   queue internals directly.
 
-Known issues / needs your feedback:
-
-- Headphone jack output can still stutter on some models. Internal speakers and
-  headphone behavior should be reported per Mac model.
-- Webcam and other bridgeOS USB devices are important SG-DMA test cases and also model dependent.
+## Debugging
 
 t2bce_audio uses `pr_debug` instead of `pr_info` for keeping the journal clean.
 You can dynamically activate verbose logging by running
+
 ``` 
 echo 'module t2bce_audio +p' | sudo tee /proc/dynamic_debug/control
 ```
-
-Please include the Mac model identifier, kernel version, loaded module versions,
-and relevant `dmesg` lines when reporting results.
+This will activate debug logs for `t2bce_audio`. You can also replace it with `t2bce_dma` or `t2bce_vhci`...
 
 ## Requirements
 
@@ -73,7 +68,7 @@ installs the ALSA UCM profile below `/usr/share/alsa/ucm2`, and runs `depmod`.
 ## Kernel tree export
 
 The driver sources can be exported with in-tree Kconfig and Kbuild files for
-distribution kernel patch sets:
+distribution kernel patch is:
 
 ```sh
 ./export-kernel-tree.sh /path/to/linux/drivers/staging/t2bce
