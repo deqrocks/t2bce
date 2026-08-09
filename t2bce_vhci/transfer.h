@@ -23,6 +23,7 @@ struct bce_vhci_transfer_queue {
     u32 max_active_requests, remaining_active_requests;
     bool active, stalled;
     u32 paused_by;
+    bool reissue_pending;
     bce_vhci_device_t dev_addr;
     u8 endp_addr;
     struct t2bce_core_queue_cq *cq;

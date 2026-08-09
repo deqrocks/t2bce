@@ -37,6 +37,7 @@ void bce_vhci_create_transfer_queue(struct bce_vhci *vhci, struct bce_vhci_trans
     q->active = true;
     q->stalled = false;
     q->paused_by = 0;
+    q->reissue_pending = false;
     q->max_active_requests = 1;
     if (usb_endpoint_type(&endp->desc) == USB_ENDPOINT_XFER_BULK)
         q->max_active_requests = BCE_VHCI_BULK_MAX_ACTIVE_URBS;
@@ -374,6 +375,8 @@ int bce_vhci_transfer_queue_do_pause(struct bce_vhci_transfer_queue *q)
         t2bce_core_flush_queue(q->vhci->client, q->sq_in);
     if (q->sq_out)
         t2bce_core_flush_queue(q->vhci->client, q->sq_out);
+    /* The flush aborted in-flight transfers; resume re-issues them. */
+    q->reissue_pending = true;
     return 0;
 }
 
@@ -385,6 +388,7 @@ int bce_vhci_transfer_queue_do_resume(struct bce_vhci_transfer_queue *q)
     int status;
     struct urb *urb, *urbt;
     struct bce_vhci_urb *vurb;
+    bool reissue;
     u8 endp_addr = (u8) (q->endp->desc.bEndpointAddress & 0x8F);
     if (bce_vhci_transfer_queue_is_ep0(q))
         pr_debug("t2bce_vhci: tq resume begin dev=%u port=%d ep=%02x active=%u paused_by=%x stalled=%u state=%u remaining=%u\n",
@@ -406,13 +410,16 @@ int bce_vhci_transfer_queue_do_resume(struct bce_vhci_transfer_queue *q)
     }
     spin_lock_irqsave(&q->urb_lock, flags);
     q->active = true;
+    /* Re-issue only transfers the pause dropped, not ones still in flight. */
+    reissue = q->reissue_pending;
+    q->reissue_pending = false;
     list_for_each_entry_safe(urb, urbt, &q->endp->urb_list, urb_list) {
         vurb = urb->hcpriv;
         if (vurb->state == BCE_VHCI_URB_INIT_PENDING) {
             if (!bce_vhci_transfer_queue_can_init_urb(q))
                 break;
             bce_vhci_urb_init(vurb);
-        } else {
+        } else if (reissue && vurb->state == BCE_VHCI_URB_WAITING_FOR_COMPLETION) {
             bce_vhci_urb_resume(vurb);
         }
     }
@@ -547,6 +554,8 @@ int bce_vhci_transfer_queue_suspend_pause(struct bce_vhci_transfer_queue *q)
         ret = -EINVAL;
         goto out;
     }
+    /* Preserved-state pause; keep the existing resume re-issue behaviour. */
+    q->reissue_pending = true;
     q->paused_by |= BCE_VHCI_PAUSE_SUSPEND;
     pr_debug("t2bce_vhci: system suspend dev=%u ep=%02x path=firmware-pause paused_by=%x->%x ret=%d state=%x active=%u\n",
             q->dev_addr, q->endp_addr, old_paused_by, q->paused_by,
@@ -584,6 +593,8 @@ static void bce_vhci_transfer_queue_reset_w(struct work_struct *work)
         t2bce_core_flush_queue(q->vhci->client, q->sq_in);
     if (q->sq_out)
         t2bce_core_flush_queue(q->vhci->client, q->sq_out);
+    /* The flush aborted in-flight transfers; resume re-issues them. */
+    q->reissue_pending = true;
     pr_debug("t2bce_vhci: tq reset command dev=%u port=%d ep=%02x\n",
             q->dev_addr, bce_vhci_transfer_queue_port(q), q->endp_addr);
     bce_vhci_cmd_endpoint_reset(&q->vhci->cq, q->dev_addr, (u8) (q->endp->desc.bEndpointAddress & 0x8F));
