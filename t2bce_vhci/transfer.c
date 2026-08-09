@@ -668,6 +668,10 @@ static void bce_vhci_transfer_queue_init_pending_urbs(struct bce_vhci_transfer_q
 {
     struct urb *urb, *urbt;
     struct bce_vhci_urb *vurb;
+
+    /* Paused endpoints must not receive transfers; do_resume() starts them. */
+    if (!q->active)
+        return;
     list_for_each_entry_safe(urb, urbt, &q->endp->urb_list, urb_list) {
         vurb = urb->hcpriv;
         if (!bce_vhci_transfer_queue_can_init_urb(q))
