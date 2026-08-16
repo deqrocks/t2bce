@@ -1,8 +1,10 @@
 #include "pcm.h"
 #include "audio.h"
+#include "clock.h"
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
 #include <linux/ktime.h>
+#include <linux/pci.h>
 
 static u64 t2audio_get_alsa_fmtbit(struct t2audio_apple_description *desc)
 {
@@ -76,7 +78,6 @@ int t2audio_create_hw_info(struct t2audio_apple_description *desc, struct snd_pc
     alsa_hw->info = (SNDRV_PCM_INFO_MMAP |
                      SNDRV_PCM_INFO_BLOCK_TRANSFER |
                      SNDRV_PCM_INFO_MMAP_VALID |
-                     SNDRV_PCM_INFO_NO_PERIOD_WAKEUP |
                      SNDRV_PCM_INFO_DOUBLE);
     if (desc->format_flags & T2AUDIO_FORMAT_FLAG_NON_MIXABLE)
         pr_warn("t2bce_audio: unsupported hw flag: NON_MIXABLE\n");
@@ -117,6 +118,70 @@ static struct t2audio_dma_buf *t2audio_pcm_dma_buf(struct t2audio_stream *stream
         return NULL;
 
     return &stream->buffers[0];
+}
+
+static void t2audio_pcm_period_work(struct work_struct *work)
+{
+    struct t2audio_stream *stream = container_of(work, struct t2audio_stream, period_work);
+    struct snd_pcm_substream *substream = READ_ONCE(stream->substream);
+
+    if (smp_load_acquire(&stream->started) && substream)
+        snd_pcm_period_elapsed(substream);
+}
+
+static enum hrtimer_restart t2audio_pcm_period_timer(struct hrtimer *timer)
+{
+    struct t2audio_stream *stream = container_of(timer, struct t2audio_stream, period_timer);
+
+    if (!smp_load_acquire(&stream->started))
+        return HRTIMER_NORESTART;
+
+    schedule_work(&stream->period_work);
+    hrtimer_forward_now(timer, stream->period_time);
+    return HRTIMER_RESTART;
+}
+
+void t2audio_pcm_init_stream(struct t2audio_stream *stream)
+{
+    hrtimer_setup(&stream->period_timer, t2audio_pcm_period_timer,
+            CLOCK_MONOTONIC, HRTIMER_MODE_REL_SOFT);
+    INIT_WORK(&stream->period_work, t2audio_pcm_period_work);
+}
+
+static void t2audio_pcm_start_period_timer(struct t2audio_stream *stream,
+        struct snd_pcm_substream *substream)
+{
+    unsigned long long period_ns = t2audio_period_ns(substream->runtime->period_size,
+            substream->runtime->rate);
+
+    if (!period_ns)
+        return;
+
+    WRITE_ONCE(stream->substream, substream);
+    stream->period_time = ns_to_ktime(period_ns);
+    hrtimer_start(&stream->period_timer, stream->period_time, HRTIMER_MODE_REL_SOFT);
+}
+
+/*
+ * Safe while the PCM stream lock is held (trigger/prepare): never waits on
+ * the timer callback or the notification work. A work item that already
+ * started may still call snd_pcm_period_elapsed() once; that is harmless on
+ * a stopped stream. Waiting here instead deadlocks, because the work item
+ * blocks on the PCM stream lock our caller holds.
+ */
+void t2audio_pcm_halt_period_timer(struct t2audio_stream *stream)
+{
+    smp_store_release(&stream->started, 0);
+    hrtimer_try_to_cancel(&stream->period_timer);
+}
+
+/* Full synchronous stop; must not be called with the PCM stream lock held. */
+void t2audio_pcm_stop_period_timer(struct t2audio_stream *stream)
+{
+    smp_store_release(&stream->started, 0);
+    hrtimer_cancel(&stream->period_timer);
+    cancel_work_sync(&stream->period_work);
+    WRITE_ONCE(stream->substream, NULL);
 }
 
 static void t2audio_dma_memset(struct t2audio_dma_buf *buf, size_t offset, int value, size_t size)
@@ -211,6 +276,9 @@ static int t2audio_pcm_open(struct snd_pcm_substream *substream)
 static int t2audio_pcm_close(struct snd_pcm_substream *substream)
 {
     struct t2audio_subdevice *sdev = snd_pcm_substream_chip(substream);
+    struct t2audio_stream *stream = t2audio_pcm_stream(substream);
+
+    t2audio_pcm_stop_period_timer(stream);
 
     pr_debug("t2bce_audio: pcm close dev=%s direction=%s substream=%u\n",
             sdev->uid,
@@ -222,6 +290,7 @@ static int t2audio_pcm_close(struct snd_pcm_substream *substream)
 static int t2audio_pcm_prepare(struct snd_pcm_substream *substream)
 {
     struct t2audio_stream *stream = t2audio_pcm_stream(substream);
+    t2audio_pcm_halt_period_timer(stream);
 
     stream->waiting_for_first_ts = true;
     stream->remote_timestamp = 0;
@@ -347,7 +416,7 @@ static int t2audio_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
             break;
         case SNDRV_PCM_TRIGGER_STOP:
             pr_debug("t2bce_audio: TRIGGER STOP %s\n", sdev->uid);
-            smp_store_release(&stream->started, 0);
+            t2audio_pcm_halt_period_timer(stream);
             err = t2audio_cmd_stop_io(sdev->a, sdev->dev_id);
             stream->remote_timestamp = 0;
             stream->waiting_for_first_ts = true;
@@ -412,7 +481,7 @@ static int t2audio_pcm_mmap(struct snd_pcm_substream *substream, struct vm_area_
         case T2AUDIO_DMA_BUF_IOMEM:
             return snd_pcm_lib_mmap_iomem(substream, area);
         case T2AUDIO_DMA_BUF_COHERENT:
-            return dma_mmap_coherent(sdev->a->dev, area, buf->ptr, buf->dma_addr, buf->size);
+            return dma_mmap_coherent(&sdev->a->pci->dev, area, buf->ptr, buf->dma_addr, buf->size);
         default:
             return -EINVAL;
     }
@@ -497,6 +566,7 @@ static void t2audio_handle_stream_timestamp(struct snd_pcm_substream *substream,
     if (stream->waiting_for_first_ts) {
         stream->waiting_for_first_ts = false;
         snd_pcm_stream_unlock_irqrestore(substream, flags);
+        t2audio_pcm_start_period_timer(stream, substream);
         return;
     }
     snd_pcm_stream_unlock_irqrestore(substream, flags);

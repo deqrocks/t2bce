@@ -9,6 +9,7 @@
 #include <sound/jack.h>
 #include "audio.h"
 #include "pcm.h"
+#include "clock.h"
 #include <linux/version.h>
 
 static int t2audio_alsa_index = SNDRV_DEFAULT_IDX1;
@@ -219,14 +220,14 @@ static int t2audio_quiesce(struct t2audio_device *t2audio, bool suspend_pcm)
             if (!smp_load_acquire(&sdev->out_streams[i].started))
                 continue;
             stopped_io = true;
-            smp_store_release(&sdev->out_streams[i].started, 0);
+            t2audio_pcm_stop_period_timer(&sdev->out_streams[i]);
         }
 
         for (i = 0; i < sdev->in_stream_cnt; i++) {
             if (!smp_load_acquire(&sdev->in_streams[i].started))
                 continue;
             stopped_io = true;
-            smp_store_release(&sdev->in_streams[i].started, 0);
+            t2audio_pcm_stop_period_timer(&sdev->in_streams[i]);
         }
 
         if (stopped_io)
@@ -350,7 +351,7 @@ static void t2audio_resume_complete(void *userdata)
 
 static void t2audio_reset_stream(struct t2audio_stream *stream)
 {
-    smp_store_release(&stream->started, 0);
+    t2audio_pcm_stop_period_timer(stream);
     stream->waiting_for_first_ts = true;
     stream->remote_timestamp = 0;
     stream->timestamp_accept_after = 0;
@@ -465,6 +466,7 @@ static void t2audio_init_dev(struct t2audio_device *a, t2audio_device_id_t dev_i
         sdev->in_streams[i].id = stream_list[i];
         sdev->in_streams[i].buffer_cnt = 0;
         t2audio_init_stream_info(sdev, &sdev->in_streams[i]);
+        t2audio_pcm_init_stream(&sdev->in_streams[i]);
         sdev->in_streams[i].latency += sdev->in_latency;
     }
 
@@ -482,6 +484,7 @@ static void t2audio_init_dev(struct t2audio_device *a, t2audio_device_id_t dev_i
         sdev->out_streams[i].id = stream_list[i];
         sdev->out_streams[i].buffer_cnt = 0;
         t2audio_init_stream_info(sdev, &sdev->out_streams[i]);
+        t2audio_pcm_init_stream(&sdev->out_streams[i]);
         sdev->out_streams[i].latency += sdev->out_latency;
     }
 
@@ -523,12 +526,14 @@ static void t2audio_free_dev(struct t2audio_subdevice *sdev)
 {
     size_t i;
     for (i = 0; i < sdev->in_stream_cnt; i++) {
+        t2audio_pcm_stop_period_timer(&sdev->in_streams[i]);
         if (sdev->in_streams[i].alsa_hw_desc)
             kfree(sdev->in_streams[i].alsa_hw_desc);
         if (sdev->in_streams[i].buffers)
             kfree(sdev->in_streams[i].buffers);
     }
     for (i = 0; i < sdev->out_stream_cnt; i++) {
+        t2audio_pcm_stop_period_timer(&sdev->out_streams[i]);
         if (sdev->out_streams[i].alsa_hw_desc)
             kfree(sdev->out_streams[i].alsa_hw_desc);
         if (sdev->out_streams[i].buffers)
@@ -698,6 +703,33 @@ static void t2audio_init_bs_stream_host(struct t2audio_device *a, struct t2audio
     if (t2audio_create_hw_info(&strm->desc, strm->alsa_hw_desc, strm->buffers[0].size)) {
         kfree(strm->alsa_hw_desc);
         strm->alsa_hw_desc = NULL;
+    } else {
+        /*
+         * t2audio_create_hw_info() sizes each ALSA period as exactly one
+         * Apple audio packet (often a single frame). Combined with
+         * SNDRV_PCM_INFO_NO_PERIOD_WAKEUP and a purely time-interpolated
+         * pointer, this forces user space to service the entire buffer
+         * within a single frame's time, hitting a hard overrun before it
+         * can ever complete a read. Re-tune the period size to roughly
+         * 10ms so normal blocking reads have realistic headroom. This is
+         * host-side bookkeeping only and does not affect the wire format.
+         */
+        struct snd_pcm_hardware *hw = strm->alsa_hw_desc;
+        u64 rate = t2audio_double_to_u64(strm->desc.sample_rate_double);
+        u64 total_frames = strm->buffers[0].size / strm->desc.bytes_per_packet;
+        u64 target_frames = rate ? (rate / 100) : total_frames; /* ~10ms */
+        u64 periods = target_frames ? (total_frames / target_frames) : 1;
+
+        if (periods < 1)
+            periods = 1;
+
+        hw->period_bytes_min = (unsigned) ((total_frames / periods) * strm->desc.bytes_per_packet);
+        hw->period_bytes_max = hw->period_bytes_min;
+        hw->periods_min = (unsigned) periods;
+        hw->periods_max = (unsigned) periods;
+
+        pr_debug("t2bce_audio: retuned capture periods: periods=%u period_bytes=%u\n",
+                (unsigned) hw->periods_min, (unsigned) hw->period_bytes_min);
     }
 }
 
@@ -815,7 +847,7 @@ void t2audio_handle_cmd_timestamp(struct t2audio_device *a, struct t2audio_msg *
             a->clock_samples++;
     }
     clock_offset_ns = a->clock_offset_ns;
-    clock_ready = a->clock_samples >= 2;
+    clock_ready = t2audio_clock_ready(a->clock_samples);
     spin_unlock_irqrestore(&a->clock_lock, flags);
     pr_debug("t2bce_audio: timestamp dev=%llx t2=%llx host=%lld seed=%llx sample_offset=%lld clock_offset=%lld\n",
             devid, timestamp, ktime_to_ns(time_os), update_seed,

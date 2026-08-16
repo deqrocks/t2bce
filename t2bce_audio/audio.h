@@ -3,6 +3,7 @@
 
 #include <linux/types.h>
 #include <linux/workqueue.h>
+#include <linux/hrtimer.h>
 #include <sound/pcm.h>
 #include "t2bce_core_transport.h"
 #include "protocol_bce.h"
@@ -85,6 +86,10 @@ struct t2audio_stream {
     bool clock_offset_valid;
     snd_pcm_sframes_t frame_min;
     int started;
+    struct hrtimer period_timer;
+    struct work_struct period_work;
+    struct snd_pcm_substream *substream;
+    ktime_t period_time;
 };
 struct t2audio_subdevice {
     struct t2audio_device *a;
