@@ -361,6 +361,7 @@ static int bce_vhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue, u1
     struct usb_port_status *ps;
     u32 port_status;
     u32 raw_port_status;
+    bool reset_resume;
     if (typeReq == GetHubDescriptor && wLength >= sizeof(struct usb_hub_descriptor)) {
         hd = (struct usb_hub_descriptor *) buf;
         memset(hd, 0, sizeof(*hd));
@@ -409,7 +410,21 @@ static int bce_vhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue, u1
             pr_debug("t2bce_vhci: hub masked stateful disconnect bounce port=%u raw=%x masked_raw=%x\n",
                     wIndex, raw_port_status, port_status);
         }
-        if (port_status & BCE_VHCI_PORT_STATUS_ENABLED)
+        /*
+         * Stateful sleep does not preserve the T2's outstanding reads on
+         * bulk OUT endpoints, and nothing the host controller does on its
+         * own makes the T2 post fresh ones; only the device's SET_INTERFACE
+         * does. Report such a port as connected but not enabled until
+         * usbcore has reset it, which makes usbcore reset-resume the device
+         * (restore its configuration and interfaces) instead of resuming it
+         * in place. EP0 credits survive sleep, so devices with only IN
+         * endpoints resume in place.
+         */
+        reset_resume = vhci->stateful_resume &&
+                       (port_status & BCE_VHCI_PORT_STATUS_CONNECTED) &&
+                       wIndex <= BITS_PER_LONG &&
+                       test_bit(wIndex - 1, &vhci->stateful_reset_ports);
+        if ((port_status & BCE_VHCI_PORT_STATUS_ENABLED) && !reset_resume)
             ps->wPortStatus |= USB_PORT_STAT_ENABLE;
         if (port_status & BCE_VHCI_PORT_STATUS_CONNECTED)
             ps->wPortStatus |= USB_PORT_STAT_CONNECTION;
@@ -419,12 +434,15 @@ static int bce_vhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue, u1
             ps->wPortStatus |= USB_PORT_STAT_RESET;
         if (port_status & BCE_VHCI_PORT_STATUS_HIGH_SPEED)
             ps->wPortStatus |= USB_PORT_STAT_HIGH_SPEED;
-        if (port_status & (BCE_VHCI_PORT_STATUS_SUSPENDED |
-                           BCE_VHCI_PORT_STATUS_SUSPENDED_LEGACY)) {
+        if ((port_status & (BCE_VHCI_PORT_STATUS_SUSPENDED |
+                            BCE_VHCI_PORT_STATUS_SUSPENDED_LEGACY)) && !reset_resume) {
             ps->wPortStatus |= USB_PORT_STAT_SUSPEND;
             if (vhci->stateful_resume && (port_status & BCE_VHCI_PORT_STATUS_CONNECTED))
                 ps->wPortStatus |= USB_PORT_STAT_ENABLE;
         }
+        if (reset_resume)
+            pr_debug("t2bce_vhci: hub reporting port=%u for reset-resume raw=%x status=%x\n",
+                    wIndex, raw_port_status, ps->wPortStatus);
 
         /*
          * These ports are fixed T2-internal devices, not user-pluggable ports.
@@ -455,6 +473,8 @@ static int bce_vhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue, u1
         }
         if (wValue == USB_PORT_FEAT_RESET) {
             pr_debug("t2bce_vhci: hub SetPortFeature RESET port=%u\n", wIndex);
+            if (wIndex <= BITS_PER_LONG)
+                clear_bit(wIndex - 1, &vhci->stateful_reset_ports);
             return bce_vhci_reset_device(vhci, wIndex, wValue);
         }
         if (wValue == USB_PORT_FEAT_SUSPEND) {
@@ -563,6 +583,8 @@ static void bce_vhci_free_device(struct usb_hcd *hcd, struct usb_device *udev)
     }
     vhci->devices[devid] = NULL;
     vhci->port_to_device[udev->portnum] = 0;
+    if (udev->portnum <= BITS_PER_LONG)
+        clear_bit(udev->portnum - 1, &vhci->stateful_reset_ports);
     bce_vhci_cmd_device_destroy(&vhci->cq, devid);
     kfree(dev);
 }
@@ -745,6 +767,7 @@ static int bce_vhci_resume_no_state(struct usb_hcd *hcd)
 
     pr_debug("t2bce_vhci: no-state resume, rebuilding controller state\n");
     vhci->stateful_resume = false;
+    vhci->stateful_reset_ports = 0;
     bce_vhci_forget_devices(vhci);
     status = bce_vhci_start_controller(vhci);
     if (status) {
@@ -771,6 +794,31 @@ static int bce_vhci_resume_no_state(struct usb_hcd *hcd)
     vhci->no_state_resume = false;
     pr_info("t2bce_vhci: no-state resume exit status=%d\n", status);
     return status;
+}
+
+/*
+ * Devices with bulk OUT endpoints lose the T2's queued reads across stateful
+ * sleep and need a reset-resume (see the hub GetPortStatus handling). OUT
+ * endpoints other than EP0 use transfer queue indices 1 to 15.
+ */
+static void bce_vhci_mark_stateful_reset_ports(struct bce_vhci *vhci)
+{
+    int port;
+    bce_vhci_device_t devid;
+
+    vhci->stateful_reset_ports = 0;
+    for (port = 1; port <= vhci->port_count &&
+                   port < ARRAY_SIZE(vhci->port_to_device) &&
+                   port <= BITS_PER_LONG; port++) {
+        devid = vhci->port_to_device[port];
+        if (!devid || !vhci->devices[devid])
+            continue;
+        if (vhci->devices[devid]->tq_mask & GENMASK(15, 1)) {
+            set_bit(port - 1, &vhci->stateful_reset_ports);
+            pr_debug("t2bce_vhci: stateful resume will reset-resume port=%d dev=%u tq_mask=%x\n",
+                    port, devid, vhci->devices[devid]->tq_mask);
+        }
+    }
 }
 
 static int bce_vhci_resume_all_queues(struct bce_vhci *vhci)
@@ -820,6 +868,7 @@ static int bce_vhci_resume_stateful(struct usb_hcd *hcd)
     vhci->port_change_pending = 0;
     vhci->stateful_suspended_bounce = 0;
     vhci->stateful_resume = true;
+    bce_vhci_mark_stateful_reset_ports(vhci);
 
     bce_vhci_event_queue_resume(&vhci->ev_system);
     bce_vhci_event_queue_resume(&vhci->ev_isochronous);
