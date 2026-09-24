@@ -44,7 +44,7 @@ static int __bce_vhci_add_hcd(struct bce_vhci *vhci);
 static void bce_vhci_shutdown_client(void *userdata);
 static void bce_vhci_pm_reset_client(void *userdata);
 static void bce_vhci_pm_prepare_client(void *userdata);
-static void bce_vhci_pm_prepare_no_state_client(void *userdata);
+static int bce_vhci_pm_prepare_no_state_client(void *userdata);
 static void bce_vhci_pm_mark_no_state_resume_client(void *userdata);
 static bool bce_vhci_pm_is_no_state_resume_client(void *userdata);
 static void bce_vhci_pm_complete_client(void *userdata);
@@ -184,15 +184,57 @@ void bce_vhci_pm_reset(struct bce_vhci *vhci)
     vhci->no_state_resume = false;
 }
 
+static void bce_vhci_resume_event_queues(struct bce_vhci *vhci)
+{
+    /* System events carry command completions, so restore them first. */
+    bce_vhci_event_queue_resume(&vhci->ev_system);
+    bce_vhci_event_queue_resume(&vhci->ev_commands);
+    bce_vhci_event_queue_resume(&vhci->ev_isochronous);
+    bce_vhci_event_queue_resume(&vhci->ev_interrupt);
+    bce_vhci_event_queue_resume(&vhci->ev_asynchronous);
+}
+
+static int bce_vhci_pause_event_queues(struct bce_vhci *vhci)
+{
+    struct bce_vhci_event_queue *queues[] = {
+        &vhci->ev_isochronous,
+        &vhci->ev_interrupt,
+        &vhci->ev_asynchronous,
+        &vhci->ev_commands,
+        &vhci->ev_system,
+    };
+    int i;
+    int status;
+
+    for (i = 0; i < ARRAY_SIZE(queues); i++) {
+        status = bce_vhci_event_queue_pause(queues[i]);
+        if (status)
+            goto rollback;
+        if (queues[i] == &vhci->ev_commands)
+            flush_workqueue(vhci->tq_state_wq);
+    }
+    return 0;
+
+rollback:
+    while (i >= 0) {
+        bce_vhci_event_queue_resume(queues[i]);
+        i--;
+    }
+    return status;
+}
+
 void bce_vhci_pm_prepare(struct bce_vhci *vhci)
 {
     cancel_work_sync(&vhci->w_add_hcd);
     vhci->port_change_pending = 0;
 }
 
-void bce_vhci_pm_prepare_no_state(struct bce_vhci *vhci)
+int bce_vhci_pm_prepare_no_state(struct bce_vhci *vhci)
 {
+    /* HCD removal needs firmware replies delivered through event queues. */
+    bce_vhci_resume_event_queues(vhci);
     bce_vhci_remove_hcd(vhci);
+    return bce_vhci_pause_event_queues(vhci);
 }
 
 void bce_vhci_pm_mark_no_state_resume(struct bce_vhci *vhci)
@@ -210,6 +252,8 @@ void bce_vhci_pm_complete(struct bce_vhci *vhci)
     if (!vhci->no_state_resume)
         return;
 
+    bce_vhci_resume_event_queues(vhci);
+    WRITE_ONCE(vhci->system_suspending, false);
     /* Re-add the VHCI HCD after the PM core completed resume ordering. */
     pr_debug("t2bce_vhci: scheduling HCD re-add after no-state wake\n");
     queue_work(vhci->tq_state_wq, &vhci->w_add_hcd);
@@ -230,9 +274,9 @@ static void bce_vhci_shutdown_client(void *userdata)
     bce_vhci_shutdown(userdata);
 }
 
-static void bce_vhci_pm_prepare_no_state_client(void *userdata)
+static int bce_vhci_pm_prepare_no_state_client(void *userdata)
 {
-    bce_vhci_pm_prepare_no_state(userdata);
+    return bce_vhci_pm_prepare_no_state(userdata);
 }
 
 static void bce_vhci_pm_mark_no_state_resume_client(void *userdata)
@@ -698,11 +742,9 @@ static int bce_vhci_suspend_quiesce(struct usb_hcd *hcd)
     }
 
     /* Keep Linux-side event queues quiet before the BCE state-save transition. */
-    bce_vhci_event_queue_pause(&vhci->ev_commands);
-    bce_vhci_event_queue_pause(&vhci->ev_system);
-    bce_vhci_event_queue_pause(&vhci->ev_isochronous);
-    bce_vhci_event_queue_pause(&vhci->ev_interrupt);
-    bce_vhci_event_queue_pause(&vhci->ev_asynchronous);
+    status = bce_vhci_pause_event_queues(vhci);
+    if (status)
+        return status;
     pr_debug("t2bce_vhci: suspend done\n");
     return 0;
 }

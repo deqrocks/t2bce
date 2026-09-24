@@ -146,20 +146,26 @@ void bce_vhci_event_queue_submit_pending(struct bce_vhci_event_queue *q, size_t 
     t2bce_core_submit_to_device(q->sq);
 }
 
-void bce_vhci_event_queue_pause(struct bce_vhci_event_queue *q)
+int bce_vhci_event_queue_pause(struct bce_vhci_event_queue *q)
 {
+    int status;
     unsigned long timeout;
+
     reinit_completion(&q->queue_empty_completion);
-    if (t2bce_core_flush_queue(q->vhci->client, q->sq))
-        pr_warn("t2bce_vhci: failed to flush event queue\n");
+    status = t2bce_core_flush_queue(q->vhci->client, q->sq);
+    if (status) {
+        pr_err("t2bce_vhci: failed to flush event queue: %d\n", status);
+        return status;
+    }
     timeout = msecs_to_jiffies(5000);
     while (t2bce_core_queue_sq_available(q->sq) != t2bce_core_queue_sq_capacity(q->sq) - 1) {
         timeout = wait_for_completion_timeout(&q->queue_empty_completion, timeout);
         if (timeout == 0) {
             pr_err("t2bce_vhci: waiting for queue to be flushed timed out\n");
-            break;
+            return -ETIMEDOUT;
         }
     }
+    return 0;
 }
 
 void bce_vhci_event_queue_resume(struct bce_vhci_event_queue *q)
